@@ -1,0 +1,417 @@
+// Set serial for debug console (to the Serial Monitor, default speed 115200)
+#define SerialMon Serial
+
+// Set serial for AT commands (to the module)
+// Use Hardware Serial on Mega, Leonardo, Micro
+#define SerialAT Serial1
+
+#define TINY_GSM_MODEM_SIM7000
+#define TINY_GSM_RX_BUFFER 1024 // Set RX buffer to 1Kb
+#define SerialAT Serial1
+
+// See all AT commands, if wanted
+// #define DUMP_AT_COMMANDS
+
+// set GSM PIN, if any
+#define GSM_PIN ""
+
+// Your GPRS credentials, if any
+const char apn[]  = "m2m64.com.attz";     //SET TO YOUR APN
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+
+#include <TinyGsmClient.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Ticker.h>
+
+#ifdef DUMP_AT_COMMANDS
+#include <StreamDebugger.h>
+StreamDebugger debugger(SerialAT, SerialMon);
+TinyGsm modem(debugger);
+#else
+TinyGsm modem(SerialAT);
+#endif
+
+#define uS_TO_S_FACTOR      1000000ULL  // Conversion factor for micro seconds to seconds
+#define TIME_TO_SLEEP       60          // Time ESP32 will go to sleep (in seconds)
+
+#define UART_BAUD           9600
+#define PIN_DTR             25
+#define PIN_TX              27
+#define PIN_RX              26
+#define PWR_PIN             4
+
+#define SD_MISO             2
+#define SD_MOSI             15
+#define SD_SCLK             14
+#define SD_CS               13
+#define LED_PIN             12
+
+
+void enableGPS(void)
+{
+    // Set SIM7000G GPIO4 LOW ,turn on GPS power
+    // CMD:AT+SGPIO=0,4,1,1
+    // Only in version 20200415 is there a function to control GPS power
+    modem.sendAT("+SGPIO=0,4,1,1");
+    if (modem.waitResponse(10000L) != 1) {
+        DBG(" SGPIO=0,4,1,1 false ");
+    }
+}
+
+void disableGPS(void)
+{
+    // Set SIM7000G GPIO4 LOW ,turn off GPS power
+    // CMD:AT+SGPIO=0,4,1,0
+    // Only in version 20200415 is there a function to control GPS power
+    modem.sendAT("+SGPIO=0,4,1,0");
+    if (modem.waitResponse(10000L) != 1) {
+        DBG(" SGPIO=0,4,1,0 false ");
+    }
+}
+
+void modemPowerOn()
+{
+    pinMode(PWR_PIN, OUTPUT);
+    digitalWrite(PWR_PIN, LOW);
+    delay(1000);    //Datasheet Ton mintues = 1S
+    digitalWrite(PWR_PIN, HIGH);
+}
+
+void modemPowerOff()
+{
+    pinMode(PWR_PIN, OUTPUT);
+    digitalWrite(PWR_PIN, LOW);
+    delay(1500);    //Datasheet Ton mintues = 1.2S
+    digitalWrite(PWR_PIN, HIGH);
+}
+
+
+void modemRestart()
+{
+    modemPowerOff();
+    delay(1000);
+    modemPowerOn();
+}
+// _____________________________________________________________________________________________
+
+#include "Adafruit_FONA.h"
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_FONA.h"
+
+/************************* MQTT SETUP *********************************/
+// MQTT setup (if you're using it, that is)
+// For Adafruit IO:
+#define AIO_SERVER      "io.adafruit.com"
+#define AIO_SERVERPORT  1883
+#define AIO_USERNAME    ""
+#define AIO_KEY         ""
+
+// Setup the FONA MQTT class by passing in the FONA class and MQTT server and login details.
+Adafruit_MQTT_FONA mqtt(&fona, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+
+// How many transmission failures in a row we're OK with before reset
+uint8_t txfailures = 0;  
+
+/****************************** MQTT FEEDS ***************************************/
+// Setup feeds for publishing.
+// Notice MQTT paths for Adafruit IO follow the form: <username>/feeds/<feedname>
+// Also notice that the combined lat/long "location" feed requires "/csv" in the name
+// The Adafruit IO map requires this format: sensor_val, lat, long, altitude
+Adafruit_MQTT_Publish feed_location = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/location/csv"); // Group GPS data for AIO map in dashboard
+Adafruit_MQTT_Publish feed_speed = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/speed");
+Adafruit_MQTT_Publish feed_head = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/heading");
+Adafruit_MQTT_Publish feed_alt = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/altitude");
+//Adafruit_MQTT_Publish feed_temp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/temperature");
+Adafruit_MQTT_Publish feed_voltage = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/voltage");
+
+// Setup a feed called 'command' for subscribing to changes.
+Adafruit_MQTT_Subscribe feed_command = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/command");
+
+/****************************** OTHER STUFF ***************************************/
+
+
+uint8_t readline(char *buff, uint8_t maxbuff, uint16_t timeout = 0);
+char imei[16] = {0}; // Use this for device ID
+uint8_t type;
+uint16_t battLevel = 0; // Battery level (percentage)
+float latitude, longitude, speed_kph, heading, altitude, second;
+uint16_t year;
+uint8_t month, day, hour, minute;
+uint8_t counter = 0;
+//char PIN[5] = "1234"; // SIM card PIN
+
+// NOTE: Keep the buffer sizes as small as possible, espeially on
+// Arduino Uno which doesn't have much computing power to handle
+// large buffers. On Arduino Mega you shouldn't have to worry much.
+char latBuff[12], longBuff[12], locBuff[50], speedBuff[12],
+     headBuff[12], altBuff[12], tempBuff[12], battBuff[12];
+
+
+
+
+
+
+
+
+
+void setup()
+{
+    // Set console baud rate
+    SerialMon.begin(115200);
+
+    delay(10);
+
+    // Set LED OFF
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH);
+
+    modemPowerOn();
+
+    Serial.println("========SDCard Detect.======");
+    SPI.begin(SD_SCLK, SD_MISO, SD_MOSI);
+    if (!SD.begin(SD_CS)) {
+        Serial.println("SDCard MOUNT FAIL");
+    } else {
+        uint32_t cardSize = SD.cardSize() / (1024 * 1024);
+        String str = "SDCard Size: " + String(cardSize) + "MB";
+        Serial.println(str);
+    }
+    Serial.println("===========================");
+
+    SerialAT.begin(UART_BAUD, SERIAL_8N1, PIN_RX, PIN_TX);
+
+
+    Serial.println("/**********************************************************/");
+    Serial.println("To initialize the network test, please make sure your LET ");
+    Serial.println("antenna has been connected to the SIM interface on the board.");
+    Serial.println("/**********************************************************/\n\n");
+
+    delay(10000);
+
+      mqtt.subscribe(&feed_command); // Only if you're using MQTT
+      Serial.println("File "__FILE__" Built on " __DATE__ " at "__TIME__);
+}
+
+void loop()
+{
+    String res;
+
+    Serial.println("========INIT========");
+
+    if (!modem.init()) {
+        modemRestart();
+        delay(2000);
+        Serial.println("Failed to restart modem, attempting to continue without restarting");
+        return;
+    }
+
+    Serial.println("========SIMCOMATI======");
+    modem.sendAT("+SIMCOMATI");
+    modem.waitResponse(1000L, res);
+    res.replace(GSM_NL "OK" GSM_NL, "");
+    Serial.println(res);
+    res = "";
+    Serial.println("=======================");
+
+    Serial.println("=====Preferred mode selection=====");
+    modem.sendAT("+CNMP?");
+    if (modem.waitResponse(1000L, res) == 1) {
+        res.replace(GSM_NL "OK" GSM_NL, "");
+        Serial.println(res);
+    }
+    res = "";
+    Serial.println("=======================");
+
+
+    Serial.println("=====Preferred selection between CAT-M and NB-IoT=====");
+    Serial.println("ADDED BAND ALTERATION...");
+     modem.sendAT("+CBANDCFG=2,4,12,13 ");
+    modem.sendAT("+CMNB=1");
+    if (modem.waitResponse(1000L, res) == 1) {
+        res.replace(GSM_NL "OK" GSM_NL, "");
+        Serial.println(res);
+    }
+    res = "";
+    Serial.println("=======================");
+
+
+    String name = modem.getModemName();
+    Serial.println("Modem Name: " + name);
+
+    String modemInfo = modem.getModemInfo();
+    Serial.println("Modem Info: " + modemInfo);
+
+    // Unlock your SIM card with a PIN if needed
+    if ( GSM_PIN && modem.getSimStatus() != 3 ) {
+        modem.simUnlock(GSM_PIN);
+    }
+    Serial.println("ADDED BAND ALTERATION...");
+     modem.sendAT("+CMNB=1 ");  //CAT-M ONLY
+     modem.sendAT("+CBANDCFG=2,4,12,13 ");
+     modem.sendAT("+CREG? ");
+     modem.sendAT("+CGREG? ");
+
+    for (int i = 0; i <= 4; i++) {
+        uint8_t network[] = {
+            2,  /*Automatic*/
+            13, /*GSM only*/
+            38, /*LTE only*/
+            51  /*GSM and LTE only*/
+        };
+        Serial.printf("Try %d method\n", network[i]);
+        modem.setNetworkMode(network[i]);
+        delay(3000);
+        bool isConnected = false;
+        int tryCount = 60;
+        while (tryCount--) {
+            int16_t signal =  modem.getSignalQuality();
+            Serial.print("Signal: ");
+            Serial.print(signal);
+            Serial.print(" ");
+            Serial.print("isNetworkConnected: ");
+            isConnected = modem.isNetworkConnected();
+            Serial.println( isConnected ? "CONNECT" : "NO CONNECT");
+            if (isConnected) {
+                break;
+            }
+            delay(1000);
+            digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+        }
+        if (isConnected) {
+            break;
+        }
+    }
+    digitalWrite(LED_PIN, HIGH);
+
+    Serial.println();
+    Serial.println("Device is connected .");
+    Serial.println();
+
+    Serial.println("=====Inquiring UE system information=====");
+    modem.sendAT("+CPSI?");
+    if (modem.waitResponse(1000L, res) == 1) {
+        res.replace(GSM_NL "OK" GSM_NL, "");
+        Serial.println(res);
+    }
+
+      Serial.println("\n---Starting GPRS TEST---\n");
+  Serial.println("Connecting to: " + String(apn));
+  if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+    delay(10000);
+    return;
+  }
+
+  Serial.print("GPRS status: ");
+  if (modem.isGprsConnected()) {
+    Serial.println("connected");
+  } else {
+    Serial.println("not connected");
+  }
+
+  String ccid = modem.getSimCCID();
+  Serial.println("CCID: " + ccid);
+
+  String imei = modem.getIMEI();
+  Serial.println("IMEI: " + imei);
+
+  String cop = modem.getOperator();
+  Serial.println("Operator: " + cop);
+
+  IPAddress local = modem.localIP();
+  Serial.println("Local IP: " + String(local));
+
+  int csq = modem.getSignalQuality();
+  Serial.println("Signal quality: " + String(csq));
+
+  SerialAT.println("AT+CPSI?");     //Get connection type and band
+  delay(500);
+  if (SerialAT.available()) {
+    String r = SerialAT.readString();
+    Serial.println(r);
+  }
+
+      delay(2000); // Retry every 2s
+  }
+  Serial.println(F("Found 'eeeeem!"));
+  Serial.println(F("---------------------"));
+  Serial.print(F("Latitude: ")); Serial.println(latitude, 6);
+  Serial.print(F("Longitude: ")); Serial.println(longitude, 6);
+  Serial.print(F("Speed: ")); Serial.println(speed_kph);
+  Serial.print(F("Heading: ")); Serial.println(heading);
+  Serial.print(F("Altitude: ")); Serial.println(altitude);
+  /*
+  // Uncomment this if you care about parsing UTC time
+  Serial.print(F("Year: ")); Serial.println(year);
+  Serial.print(F("Month: ")); Serial.println(month);
+  Serial.print(F("Day: ")); Serial.println(day);
+  Serial.print(F("Hour: ")); Serial.println(hour);
+  Serial.print(F("Minute: ")); Serial.println(minute);
+  Serial.print(F("Second: ")); Serial.println(second);
+  */
+  Serial.println(F("---------------------"));
+
+  // Format the floating point numbers
+  dtostrf(latitude, 1, 6, latBuff); // float_val, min_width, digits_after_decimal, char_buffer
+  dtostrf(longitude, 1, 6, longBuff);
+  dtostrf(speed_kph, 1, 0, speedBuff);
+  dtostrf(heading, 1, 0, headBuff);
+  dtostrf(altitude, 1, 1, altBuff);
+  dtostrf(battLevel, 1, 0, battBuff);
+
+  // Also construct a combined, comma-separated location array
+  // (many platforms require this for dashboards, like Adafruit IO):
+  sprintf(locBuff, "%s,%s,%s,%s", speedBuff, latBuff, longBuff, altBuff); // This could look like "10,33.123456,-85.123456,120.5"
+  
+  // Ensure the connection to the MQTT server is alive (this will make the first
+  // connection and automatically reconnect when disconnected). See the MQTT_connect
+  // function definition further below.
+  MQTT_connect();
+
+  // Now publish all the data to different feeds!
+  // The MQTT_publish_checkSuccess handles repetitive stuff.
+  // You can see the function near the end of this sketch.
+  // For the Adafruit IO dashboard map we send the combined lat/long buffer
+  MQTT_publish_checkSuccess(feed_location, locBuff);
+  MQTT_publish_checkSuccess(feed_speed, speedBuff); // Included in "location" feed
+  MQTT_publish_checkSuccess(feed_head, headBuff);
+  MQTT_publish_checkSuccess(feed_alt, altBuff); // Included in "location" feed
+  MQTT_publish_checkSuccess(feed_voltage, battBuff);
+ 
+  // This is our 'wait for incoming subscription packets' busy subloop
+  Adafruit_MQTT_Subscribe *subscription;
+  while ((subscription = mqtt.readSubscription(5000))) {
+    if (subscription == &feed_command) {
+      Serial.print(F("*** Got: "));
+      Serial.println((char *)feed_command.lastread);
+    }
+  }
+
+  // Control an LED based on what we receive from the command feed subscription!
+  if (strcmp(feed_command.lastread, "ON") == 0) {
+    Serial.println(F("*** Commanded to turn on LED!"));
+    digitalWrite(LED, HIGH);
+  }
+  else if (strcmp(feed_command.lastread, "OFF") == 0) {
+    Serial.println(F("*** Commanded to turn off LED!"));
+    digitalWrite(LED, LOW);
+  }
+
+  // Delay until next post
+  Serial.print(F("Waiting for ")); Serial.print(samplingRate); Serial.println(F(" seconds\r\n"));
+  delay(samplingRate * 1000UL); // Delay
+}
+
+void MQTT_publish_checkSuccess(Adafruit_MQTT_Publish &feed, const char *feedContent) {
+  Serial.println(F("Sending data..."));
+  if (! feed.publish(feedContent)) {
+    Serial.println(F("Failed"));
+    txfailures++;
+  }
+  else {
+    Serial.println(F("OK!"));
+    txfailures = 0;
+  }
+    }
+}
